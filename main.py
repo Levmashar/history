@@ -1,27 +1,44 @@
+# main.py
 import json
-import os
-from typing import Any, Dict, List, Literal, Tuple
+import re
+from typing import List, Dict, Any
 
 import numpy as np
-from fastapi import FastAPI, Query
+from fastapi import FastAPI
 from fastapi.middleware.cors import CORSMiddleware
 from pydantic import BaseModel
-from sklearn.feature_extraction.text import TfidfVectorizer
-from sklearn.metrics.pairwise import cosine_similarity
-import re
+from sentence_transformers import SentenceTransformer
 
-# ---------- CONFIG ----------
-CHUNKS_PATH = "history_chunks.jsonl"  # produced by your chunker
-TOP_K = 5  # how many chunks to pull for an answer
+CHUNKS_FILE = "history_chunks.jsonl"
+MODEL_NAME = "sentence-transformers/distiluse-base-multilingual-cased-v2"
 
-# ---------- LOAD CHUNKS (JSONL!) ----------
+app = FastAPI(title="Armenian History Exam Helper")
+
+# Allow frontend (Firebase) to call backend (Render / localhost)
+app.add_middleware(
+    CORSMiddleware,
+    allow_origins=["*"],       # in production you can restrict this
+    allow_credentials=True,
+    allow_methods=["*"],
+    allow_headers=["*"],
+)
+
+
+class QuestionRequest(BaseModel):
+    question: str
+    # "short" -> very brief, "sentence" -> 1–2 sentences, "essay" -> small essay
+    mode: str = "sentence"
+
+
+class AnswerResponse(BaseModel):
+    answer: str
+    mode: str
+    sources: List[Dict[str, Any]]
+
 
 def load_chunks(path: str) -> List[Dict[str, Any]]:
-    """
-    Reads a JSONL file: one JSON object per line.
-    Returns a list of dicts.
-    """
-    chunks: List[Dict[str, Any]] = []
+    """Load JSONL chunks created by your chunker script."""
+    chunks = []
     with open(path, "r", encoding="utf-8") as f:
         for line in f:
             line = line.strip()
@@ -31,211 +48,138 @@ def load_chunks(path: str) -> List[Dict[str, Any]]:
     return chunks
 
 
-if not os.path.exists(CHUNKS_PATH):
-    raise FileNotFoundError(f"Chunk file not found: {CHUNKS_PATH}")
+print("🔹 Loading chunks from history_chunks.jsonl ...")
+CHUNKS = load_chunks(CHUNKS_FILE)
+TEXTS = [c["text"] for c in CHUNKS]
+print(f"   Loaded {len(CHUNKS)} chunks.")
 
-CHUNKS: List[Dict[str, Any]] = load_chunks(CHUNKS_PATH)
-CORPUS = [c["text"] for c in CHUNKS]
+print("🔹 Loading embedding model (multilingual, supports Armenian)...")
+EMBEDDER = SentenceTransformer(MODEL_NAME)
 
-# ---------- VECTORIZER & MATRIX (FREE, LOCAL) ----------
+print("🔹 Encoding chunks (runs once at startup)...")
+EMBEDDINGS = EMBEDDER.encode(TEXTS, convert_to_numpy=True, normalize_embeddings=True)
+print("✅ Backend is ready to answer questions.")
 
-# Simple word + bigram TF-IDF over Armenian text
-VECTORIZER = TfidfVectorizer(
-    analyzer="word",
-    ngram_range=(1, 2),
-    min_df=1,
-    # no stop_words="english" because text is Armenian
-)
-
-MATRIX = VECTORIZER.fit_transform(CORPUS)
+WORD_RE = re.compile(r"\w+", flags=re.UNICODE)
+SENT_SPLIT_RE = re.compile(r"(?<=[\.!?։])\s+")
 
 
-# ---------- RETRIEVAL ----------
+def tokenize(text: str) -> List[str]:
+    """Very simple tokenizer (works fine for Armenian too)."""
+    return WORD_RE.findall(text.lower())
 
-def retrieve(question: str, top_k: int = TOP_K) -> List[Tuple[Dict[str, Any], float]]:
+
+def split_sentences(text: str) -> List[str]:
+    """Split text into sentences using . ! ? և հայերեն «։»."""
+    text = text.replace("\n", " ")
+    parts = SENT_SPLIT_RE.split(text)
+    return [p.strip() for p in parts if p.strip()]
+
+
+def retrieve_chunks(question: str, top_k: int = 4):
+    """Semantic search: find top_k most relevant chunks using embeddings."""
+    q_vec = EMBEDDER.encode(
+        [question],
+        convert_to_numpy=True,
+        normalize_embeddings=True
+    )[0]
+    sims = EMBEDDINGS @ q_vec  # cosine similarity because vectors are normalized
+    idxs = np.argsort(-sims)[:top_k]
+    return [(CHUNKS[i], float(sims[i])) for i in idxs]
+
+
+def generate_answer(question: str, contexts: List[str], mode: str) -> str:
     """
-    Returns top_k chunks with cosine similarity scores.
+    Simple extractive summarizer:
+    - picks sentences from the most relevant paragraphs
+    - scores by word overlap with the question
+    - returns short / 1–2 sentence / essay-length answer
     """
-    q_vec = VECTORIZER.transform([question])
-    sims = cosine_similarity(q_vec, MATRIX)[0]
-    # sort indices by similarity
-    top_indices = np.argsort(sims)[::-1][:top_k]
+    combined = " ".join(contexts)
+    sentences = split_sentences(combined)
 
-    results: List[Tuple[Dict[str, Any], float]] = []
-    for idx in top_indices:
-        score = float(sims[idx])
-        if score <= 0:
-            continue
-        results.append((CHUNKS[idx], score))
-    return results
-
-
-# ---------- SIMPLE ARMENIAN-FRIENDLY SENTENCE SPLIT ----------
-
-SENTENCE_SPLIT_RE = re.compile(r'(?<=[\.!\?։])\s+')
-
-def pick_sentences(text: str, max_words: int) -> str:
-    """
-    Pick sentences from text until we reach ~max_words.
-    Very simple, but works for short/sentence/essay modes.
-    """
-    sentences = SENTENCE_SPLIT_RE.split(text)
-    out: List[str] = []
-    count = 0
-
-    for s in sentences:
-        s = s.strip()
-        if not s:
-            continue
-        words = s.split()
-        if not words:
-            continue
-
-        # if already have something and this would overshoot a lot, stop
-        if count + len(words) > max_words and out:
-            break
-
-        out.append(s)
-        count += len(words)
-        if count >= max_words:
-            break
-
-    return " ".join(out).strip()
-
-
-def build_answer(question: str,
-                 style: Literal["short", "sentence", "essay"],
-                 max_words: int | None = None) -> Tuple[str, List[Tuple[Dict[str, Any], float]]]:
-    """
-    Build an answer completely from textbook chunks.
-    Returns (answer_text, sources_with_scores)
-    """
-    hits = retrieve(question)
-
-    if not hits:
-        # Armenian fallback message
+    if not sentences:
         return (
-            "Չգտնվեց համապատասխան հատված ուսումնական նյութում։ Փորձիր հարցը ձևակերպել այլ կերպ կամ ավելացնել մանրամասներ։",
-            []
+            "Չկարողացա գտնել համապատասխան տեղեկություն դասագրքերում։ "
+            "Փորձիր հարցդ ձևակերպել այլ կերպ կամ ավելի կոնկրետ։"
         )
 
-    # Just concatenate the top chunks' text and then cut sentences.
-    source_text = " ".join([c["text"] for c, _ in hits])
+    q_tokens = set(tokenize(question))
+    scored = []
 
-    if style == "essay":
-        if max_words is None:
-            max_words = 250
-    elif style == "sentence":
-        if max_words is None:
-            max_words = 60
-    else:  # short
-        if max_words is None:
-            max_words = 25
+    for idx, sent in enumerate(sentences):
+        tokens = set(tokenize(sent))
+        if not tokens:
+            continue
+        overlap = len(tokens & q_tokens)
+        score = overlap / (len(tokens) ** 0.5 + 1e-6)
+        scored.append((idx, sent, score))
 
-    answer = pick_sentences(source_text, max_words)
-    return answer, hits
+    if not scored:
+        # fallback: keep original order
+        scored = [(idx, s, 0.0) for idx, s in enumerate(sentences)]
 
+    # sort by relevance
+    scored.sort(key=lambda x: x[2], reverse=True)
 
-# ---------- FASTAPI APP ----------
+    mode = mode.lower()
 
-app = FastAPI(
-    title="History QA (Textbooks 7–12)",
-    description="Free Armenian history QA over textbook chunks only.",
-    version="0.1.0",
-)
+    # 1) Very short answer
+    if mode == "short":
+        top_sentence = scored[0][1]
+        words = top_sentence.split()
+        if len(words) > 25:
+            return " ".join(words[:25]) + "…"
+        return top_sentence
 
-# Allow requests from your future frontend
-app.add_middleware(
-    CORSMiddleware,
-    allow_origins=["*"],  # tighten later if you want
-    allow_credentials=True,
-    allow_methods=["*"],
-    allow_headers=["*"],
-)
+    # 2) Decide how many sentences we want
+    if mode == "essay":
+        n = min(7, len(scored))  # small essay
+    else:  # "sentence" or anything else
+        n = min(2, len(scored))  # 1–2 sentences
 
-
-class QuestionRequest(BaseModel):
-    question: str
-    answer_style: Literal["short", "sentence", "essay"] = "short"
-    max_words: int | None = None
+    # Keep chronological order of the chosen sentences
+    chosen = sorted(scored[:n], key=lambda x: x[0])
+    return " ".join(s for _, s, _ in chosen)
 
 
-@app.get("/")
-def root():
-    return {
-        "message": "History QA is running.",
-        "usage": {
-            "GET": "/ask?question=...&answer_style=short|sentence|essay",
-            "POST": "/ask",
-            "POST_body_example": {
-                "question": "Հարցդ այստեղ գրի",
-                "answer_style": "sentence"
-            }
-        },
-    }
+@app.get("/health")
+async def health():
+    return {"status": "ok"}
 
 
-@app.get("/ask")
-def ask_get(
-    question: str = Query(..., description="Քո հարցը հայերենով"),
-    answer_style: Literal["short", "sentence", "essay"] = Query(
-        "short", description=" desired answer length "
-    ),
-    max_words: int | None = Query(
-        None, description="Optional max word count override"
-    ),
-):
-    answer, hits = build_answer(question, answer_style, max_words)
+@app.post("/ask", response_model=AnswerResponse)
+async def ask(req: QuestionRequest):
+    question = req.question.strip()
+    if not question:
+        return AnswerResponse(
+            answer="Խնդրում եմ գրիր հարցդ։",
+            mode=req.mode,
+            sources=[]
+        )
 
-    sources = [
-        {
+    mode = req.mode.lower()
+    if mode not in {"short", "sentence", "essay"}:
+        mode = "sentence"
+
+    top_chunks = retrieve_chunks(question, top_k=4)
+    contexts = [c["text"] for c, _ in top_chunks]
+    answer = generate_answer(question, contexts, mode)
+
+    # Metadata about used paragraphs for UI
+    sources: List[Dict[str, Any]] = []
+    for c, score in top_chunks:
+        sources.append({
             "class": c.get("class"),
             "part": c.get("part"),
             "chapter": c.get("chapter"),
             "paragraph": c.get("paragraph"),
             "paragraph_title": c.get("paragraph_title"),
-            "score": score,
-        }
-        for c, score in hits
-    ]
+            "score": round(score, 3),
+        })
 
-    return {
-        "answer": answer,
-        "answer_style": answer_style,
-        "sources": sources,
-    }
-
-
-@app.post("/ask")
-def ask_post(req: QuestionRequest):
-    """
-    POST with JSON body:
-    {
-      "question": "քո հարցը",
-      "answer_style": "short" | "sentence" | "essay"
-    }
-    """
-    answer, hits = build_answer(req.question, req.answer_style, req.max_words)
-
-    sources = [
-        {
-            "class": c.get("class"),
-            "part": c.get("part"),
-            "chapter": c.get("chapter"),
-            "paragraph": c.get("paragraph"),
-            "paragraph_title": c.get("paragraph_title"),
-            "score": score,
-        }
-        for c, score in hits
-    ]
-
-    return {
-        "answer": answer,
-        "answer_style": req.answer_style,
-        "sources": sources,
-    }
-
-
-if __name__ == "__main__":
-    import uvicorn
-    uvicorn.run("main:app", host="127.0.0.1", port=8000, reload=True)
+    return AnswerResponse(
+        answer=answer,
+        mode=mode,
+        sources=sources
+    )
